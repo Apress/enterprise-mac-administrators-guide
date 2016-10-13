@@ -1,0 +1,378 @@
+#!/bin/bash
+
+######### 
+##  loginhook.sh
+##	Created 06/26/06 by Beau Hunter beauh@mac.com 
+##
+##  Mac OS X login hook used for folder redirection.
+##
+##	Usage:
+##      Specify variables '$localDataDir' and '$redirectDirs'
+##      The former is a simple path which will contain
+##      User-specific redirect folders.
+##      $redirectDirs is a comma separated list of redirect parameter.
+##      Each paramater consists of two colon separated components,
+##      the first value is the path to redirect, the second option
+##      includes flags to determine our redirect style. 
+##  
+##      Example:
+##          localDataDir="/Users/Local"
+##          redirectDirs="Library/Caches:deleteExisting,Sites/moveExisting"
+##      
+##          In this example, we will redirect ~/Library/Caches to 
+##          /Users/Local/shortname/Library/Caches, it will delete any item 
+##          existing in the home directory at that path. We will also redirect
+##          ~/Sites, but we will rename an existing item to ~/Sites (network)
+##			A third option syncExisting, can be used to copy items from network
+##			folders to local folders prior to redirection. At this point
+##			this is a one-way sync (local contents are not copied back to the
+##			server at logout).
+##      
+##
+##########################
+
+
+########## Variables #############
+
+## Global folder where all local users cache data will reside
+localDataDir="/Users/Local"
+
+## Specify our Redirects
+## example: redirectDirs="Library/Caches:deleteExisting,Library/Fonts:syncExisting"
+redirectDirs="Library/Caches:deleteExisting,Library/Fonts:syncExisting"
+redirectDirs+=",Movies:moveExisting,Pictures:moveExisting,Library/Mail:moveExisting"
+redirectDirs+=",Library/Printers:deleteExisting,Library/Mail:moveExisting"
+redirectDirs+=",Library/Application Support/Adobe/Acrobat:deleteExisting"
+
+## Tune AFP client settings (sets afp_wan_quantum to 131700 and 
+## afp_wan_threshold to 1000). set to 1 for true
+declare -x -i afpTuning=0
+
+## Look for and clear iPhoto locks. set to 1 for true
+declare -x -i iPhotoLockFix=0
+
+## look for and clear FireFox locks. set to 1 for true
+declare -x -i firefoxLockFix=0
+
+########## End Config #############
+
+
+###### Declare our binaries ##########
+
+declare -x awk="/usr/bin/awk"
+declare -x basename="/usr/bin/basename"
+declare -x chown="/usr/sbin/chown"
+declare -x chmod="/bin/chmod"
+declare -x date="/bin/date"
+declare -x defaults="/usr/bin/defaults"
+[ -f "/usr/bin/dscl" ] && declare -x dscl="/usr/bin/dscl"
+declare -x expr="/bin/expr"
+declare -x find="/usr/bin/find"
+declare -x grep="/usr/bin/grep"
+declare -x id="/usr/bin/id"
+declare -x ifconfig="/sbin/ifconfig"
+declare -x ln="/bin/ln"
+declare -x ls="/bin/ls"
+declare -x logger="/usr/bin/logger"
+declare -x mkdir="/bin/mkdir"
+declare -x mv="/bin/mv"
+[ -f "/usr/bin/nicl" ] && declare -x nicl="/usr/bin/nicl"
+declare -x ntpdate="/usr/sbin/ntpdate"
+declare -x rm="/bin/rm"
+declare -x rsync="/usr/bin/rsync"
+declare -x stat="/usr/bin/stat"
+declare -x touch="/usr/bin/touch"
+
+
+########## Static Variables - leave defaults #############
+theUser=$1
+eval theHome=~$1
+localUserDir="${localDataDir:?}/$1"
+networkUserDir=$theHome
+theDate="$("$date" +'%m%d%y')"
+hwAddress="$("$ifconfig" en0 | "$awk" '/ether/ { gsub(":", ""); print $2 }')"
+loggerFlags="-t loginhook -s"
+exitCode=0
+version="2009122101"
+
+######### Init ############
+"$logger" $loggerFlags "Executing login script v.$version for user $theUser with home $theHome..."
+startTime="$("$date" +'%s')"
+
+
+########## Functions #############
+
+function redirectPath () {
+## function accepts two parameters, the first is a path relative to ~
+## the second controls behavior of data existing in network home. 
+## Acceptable values include:
+## deleteExisting:  Delete existing item in network home
+## syncExisting:    Perform an rsync of network path to local path then move
+## moveExisting:    Renames the network item to ${path} (network), enumerates if necessary
+## 
+## Dependencies:
+##	The following vars need to be set: $theUser, $localUserDir, $networkUserDir
+
+	declare -x sourcePath="$1"
+	declare -x flags="$2"
+	
+    "$logger" $loggerFlags " Redirecting Folder: $sourcePath with flags: $flags"
+    
+	## sanity checks on sourcePath
+	if [ -z "$sourcePath"  ]; then
+		"${logger:=/usr/bin/logger}" $loggerFlags " - redirectPath() Error: no source path specified!"
+		return 1
+    fi
+    
+	## sanity checks on flags
+	if [ -z "$flags" ]; then
+		flags="moveExisting"
+	fi
+    
+    oldIFS=$IFS
+    IFS=$','
+	goodFlagValues="deleteExisting,syncExisting,moveExisting"
+	for value in $goodFlagValues; do
+		if [ "$flags" == "$value" ] ; then
+			isGoodValue=true
+		fi	
+	done
+    IFS=$','
+	if [ "$isGoodValue" != true ]; then
+		"$logger" $loggerFlags " - redirectPath() Error: invalid option: $flags, using moveExisting"
+		flags="moveExisting"
+        exitCode=1	
+	fi
+
+	## sanity checks on resources
+	declare -x localPath="${localUserDir:?}/${sourcePath:?}"
+	if ( [ ! -d "${localPath:?}" ] ); then
+		"${mkdir:=/bin/mkdir}" -p "$localPath"
+		if [ $? != 0 ]; then
+            "$logger" $loggerFlags " - redirectPath() Error: Could not create redirection folder, exiting"
+			return 2
+		fi
+	fi 
+    ## check ownership on the file, if our user doesn't match, propagate owner
+    if [ "$("$stat" -f "%u" "$localPath")" != "$("$id" -u ${theUser:?})" ]; then
+    	"$logger" $loggerFlags " - redirectPath() Error: User is not the owner of their local redirect folder, populating values!"
+    	"${chown:=/usr/sbin/chown}" -R "${theUser:?}" "$localPath" &> /dev/null
+	    if [ $? != 0 ]; then
+				"$logger" $loggerFlags "   - redirectPath() Error changing ownership on: $localPath"
+    	fi
+    else
+    	"$logger" $loggerFlags "  - redirectPath() Permissions checks pass!"
+    fi
+    
+    ## push out 700 to the local folder.
+    "${chmod:=/bin/chmod}" 700 "$localPath" &> /dev/null
+    if [ $? != 0 ]; then
+			"$logger" $loggerFlags "   - redirectPath() Error changing permissions on: $localPath"
+    fi
+	## if our network dir is there, redirect as per our flags
+	declare -x networkPath="${networkUserDir:?}/${sourcePath:?}"
+	if ( [ -L "${networkPath:?}" ] ); then
+		"${rm:=/bin/rm}" "$networkPath"
+	fi
+	if [ -f "$networkPath" ]; then
+		"$logger" $loggerFlags " - redirectPath() Error: Found file when expecting directory at: $networkPath, renaming"
+		 ## check for everyone deny delete acl and remove (it prevents us from working)
+        declare -x aclNum="$("${ls:=/bin/ls}" -aled "$networkPath" | "$awk" -F: '/everyone deny delete/ {print $1}')"
+        if ( [ ! -z "$aclNum" ] && [ $aclNum -ge 0 ] ); then
+            "$logger" $loggerFlags "     - Removing ACL 'everyone deny delete'" 
+            "${chmod}" -a# ${aclNum} "$networkPath" 
+        fi
+        "${mv:=/bin/mv}" "$networkPath" "$networkPath (redirected)"
+	fi
+
+	"$logger" $loggerFlags " - Redirection from: $networkPath to: $localPath"
+
+	## Perfom sync if necessary, perform (network) folder rename checks 
+	if ( [ "$flags" == "moveExisting" ] || [ "$flags" == "syncExisting" ] ); then
+		if [ -d "$networkPath" ]; then
+			if [ "$flags" == "syncExisting" ]; then
+				"$logger" $loggerFlags "   - Sync existing dir: $networkPath/ to: $localPath/"
+				"${rsync:=/usr/bin/rsync}" -auE "$networkPath"/ "$localPath"/
+			fi
+			if ( [ ! -d "${networkPath} (network)" ] && [ ! -f "${networkPath} (network)" ] ); then
+				newPath="${networkPath} (network)"
+			else
+				i=1
+				while ( [ -d "${networkPath} (network) $i" ] || [ -f "${networkPath} (network) $i" ] ); do
+					i="$(expr $i + 1)"
+				done
+				newPath="${networkPath} (network) $i"
+			fi
+			
+            "$logger" $loggerFlags "   - Moving existing object: $networkPath to: $newPath"
+            ## check for everyone deny delete acl and remove (it prevents us from working)
+            declare -x aclNum="$("${ls:=/bin/ls}" -aled "$networkPath" | "$awk" -F: '/everyone deny delete/ {print $1}')"
+            if ( [ ! -z "$aclNum" ] && [ $aclNum -ge 0 ] ); then
+                "$logger" $loggerFlags "     - Removing ACL 'everyone deny delete'" 
+                "${chmod}" -a# ${aclNum} "$networkPath" 
+            fi
+			"$mv" "${networkPath}" "$newPath" || 
+            ( "$logger" $loggerFlags "     - Move failed with code: $?, aborting!" && 
+            return 3  ) 
+            
+		fi
+	elif [ "$flags" == "deleteExisting" ]; then
+		if ([ -d "$networkPath" ] || [ -f "$networkPath" ]); then
+			"$logger" $loggerFlags "   - Removing existing dir: $networkPath"
+            ## check for everyone deny delete acl and remove (it prevents us from working)
+            declare -x aclNum="$("${ls:=/bin/ls}" -aled "$networkPath" | "$awk" -F: '/everyone deny delete/ {print $1}')"
+            if ( [ ! -z "$aclNum" ] && [ $aclNum -ge 0 ] ); then
+                "$logger" $loggerFlags "     - Removing ACL 'everyone deny delete'" 
+                "${chmod}" -a# ${aclNum} "$networkPath" 
+            fi
+            "$rm" -r "$networkPath"
+        fi
+	fi
+    	
+    ## If the folder structure hasn't been created yet, then create it now 
+    declare -x parentDir="$("${basename:=/usr/bin/basename}" "$networkPath")"
+    if [ ! -d "$parentDir" ]; then
+            "$logger" $loggerFlags "   - Redirectpath: \"$parentDir\" not found! creating parent folder..."
+            "$mkdir" -p "$parentDir"
+            "$chown" "$theUser" "$parentDir"
+    fi
+    
+    ## Create our symlink
+    "$logger" $loggerFlags "   - Creating symbolic link: \"$ln\" -s \"$localPath\" \"$networkPath\""
+    "${ln:=/bin/ln}" -s "$localPath" "$networkPath"
+    if [ $? != 0 ]; then
+        "$logger" $loggerFlags "  - Failed to establish symbolic link, code: $?"
+    fi
+    return 0
+}  ## end redirectPath
+
+########## End Functions #############
+
+
+
+########## Start Procedural Script ##############
+
+###### All  Users ######
+
+## AFP Tuning
+if [ $afpTuning -ge 1 ]; then
+	"$logger" $loggerFlags "Tuning AFP client settings"
+	"$defaults" write -g com.apple.AppleShareClientCore -dict-add afp_wan_quantum -int 131700
+	"$defaults" write -g com.apple.AppleShareClientCore -dict-add afp_wan_threshold -int 1000
+fi
+
+
+## iPhoto Fix
+if [ $iPhotoLockFix -ge 1 ]; then
+    "$logger" $loggerFlags " - Running iPhotoFix"
+    if ( [ -f "$theHome"/Pictures/iPhoto\ Library/iPhotoLock.data ] && [ "$existingLogin" != "true" ] ); then 
+        "$logger" $loggerFlags "    * iPhoto Lock file found! Removing!"
+        rm "$theHome"/Pictures/iPhoto\ Library/iPhotoLock.data
+    fi
+fi
+
+## FireFox Fix
+if [ $firefoxLockFix -ge 1 ]; then
+    "$logger" $loggerFlags " - Running FirefoxFix"
+    ffPath="$theHome/Library/Application Support/Firefox"
+    if [ -f "$ffPath/profiles.ini" ]; then
+       "$logger" $loggerFlags "    * Profile found at $ffPath/profile.ini"
+        ffProfDir=`cat "$ffPath/profiles.ini" | awk -F= '/Path/ {print$2}'`
+    else
+       "$logger" $loggerFlags "    * Error: No profile file found at $ffPath/profiles.ini!"
+    fi
+    ffLockFile="$ffPath/$ffProfDir/.parentLock"
+    "$logger" $loggerFlags "    * Profile directory: $ffPath/$ffProfDir"
+
+    if ( [ -f "$ffLockFile" ] && [ "$existingLogin" != "true" ] ); then 
+        "$logger" $loggerFlags "    * Firefox lock file found! Removing!"
+        rm "$ffLockFile"
+    fi
+fi
+
+###### End All Users ######
+
+
+## check to see if the user has a local home, and quit if so
+"$logger" $loggerFlags "Checking user source"
+
+if [ $(echo "$theHome" | grep -e "^/Users") ]; then
+    "$logger" $loggerFlags "User has a local homedirectory: \"$theHome\", aborting!" && exit 1
+fi
+
+
+###### Network Home Users ######
+
+## If our network home directory doesn't exist, bail out!
+if [ ! -d "$networkUserDir" ]; then
+	"$logger" $loggerFlags "Network home directory path: \"$networkUserDir\""
+    ." does not exist, loginhook is aborting!";
+    exit 5
+
+fi
+
+"$logger" $loggerFlags "Registering login, clearing out expired login cache"
+## delete any stale login files
+"$find" "$theHome"/Library -maxdepth 1 -mtime +1 -name ".*.loginhook" -exec "$rm" {} \;
+
+## Check for login files from other computers less than 24 hours old.
+loginFileCount="$(ls "$theHome"/Library/.*.loginfile 2> /dev/null | "$grep" -c -v $hwAddress)"
+if [ $loginFileCount == 0 ]; then
+    existingLogin=false
+fi
+## touch our login file
+echo "$redirectDirs" > "$theHome"/Library/".${hwAddress}.loginfile"
+
+## create global local data folder if it doesn't exist
+if [ ! -d "${localDataDir:?}" ]; then
+	"$mkdir" -p "$localDataDir"
+	"$chown" root:wheel "$localDataDir"
+fi
+## create local user data folder if it doesn't exist
+if [ ! -d "$localUserDir" ]; then
+	"$mkdir" -p "$localUserDir"
+fi
+
+## check ownership on the folder, if our user doesn't match, propagate owner
+if [ "$("$stat" -f "%u" "$localUserDir")" != "$("$id" -u ${theUser:?})" ]; then
+    "$logger" $loggerFlags " - Error: User is not the owner of their local redirect folder, populating values!"
+	"$chown" "$theUser" "$localUserDir"
+fi
+## push out 700 to the local folder.
+"${chmod:=/bin/chmod}" 700 "$localUserDir" &> /dev/null
+if [ $? != 0 ]; then
+    "$logger" $loggerFlags "   - Error changing permissions on: $localUserDir"
+fi
+
+## setup our cache links.
+"$logger" $loggerFlags "Setting up local caching scheme for $theUser with home $theHome..."
+
+
+########## Redirects #############
+
+if [ ! -z "redirectDirs" ]; then
+    oldIFS=$IFS
+    IFS=$','
+    for redirect in $redirectDirs; do
+        theDir="$(echo "$redirect" | "$awk" -F: '{print $1}')"
+        redirectFlag="$(echo "$redirect" | "$awk" -F: '{print $2}')"
+        redirectPath "$theDir" "$redirectFlag"
+        if [ $? != 0 ]; then
+            exitCode=$?
+        fi
+    done;
+    IFS=$oldIFS
+fi
+
+
+########## post flight code #############
+
+## do our time calculations
+endTime="$("$date" +'%s')"
+totalSec="$("$expr" ${endTime:?} - ${startTime:?})"
+min="$("$expr" ${totalSec:?} / 60)"
+sec="$("$expr" ${totalSec:?} % 60)"
+"$logger" $loggerFlags "Completed operations in $min minutes and $sec seconds"
+
+exit $exitCode
+	
